@@ -1,11 +1,14 @@
-// api/audit.js  —  GEO Architect: single-file Vercel serverless function.
+// api/audit.js  —  GEO Architect: single-file Vercel serverless function (v0.3).
 // POST { "url": "https://any-business.com" }  -> crawls the site, derives
-// name/location/services, runs SearchApi.io (local pack + organic + AI Overview),
-// returns an honesty-tagged DataBundle. Key is read from env, never returned.
-// Zero dependencies. Node 18+ (global fetch).
+// name/location/services, runs SearchApi.io (local pack + organic + AI Overview)
+// AND PageSpeed Insights (Core Web Vitals), returns an honesty-tagged DataBundle.
+// Keys read from env, never returned. Zero dependencies. Node 18+ (global fetch).
+
+export const config = { maxDuration: 60 }; // PageSpeed Lighthouse runs can be slow
 
 const HONESTY = { VERIFIED: "VERIFIED", ASSUMED: "ASSUMED" };
 const SEARCHAPI_BASE = "https://www.searchapi.io/api/v1/search";
+const PSI_BASE = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed";
 
 /* ---------------- helpers: crawl ---------------- */
 function domainOf(url) {
@@ -52,7 +55,7 @@ function parseSite(html, url){
 async function fetchHtml(url,{signal,timeoutMs=12000}={}){
   const target=/^https?:\/\//i.test(url)?url:`https://${url}`;
   const ctrl=signal?null:new AbortController(); const t=ctrl?setTimeout(()=>ctrl.abort(),timeoutMs):null;
-  try{ const res=await fetch(target,{headers:{"User-Agent":"GEOArchitectBot/0.2 (+audit)",Accept:"text/html,*/*"},redirect:"follow",signal:signal||ctrl.signal});
+  try{ const res=await fetch(target,{headers:{"User-Agent":"GEOArchitectBot/0.3 (+audit)",Accept:"text/html,*/*"},redirect:"follow",signal:signal||ctrl.signal});
     if(!res.ok)throw new Error(`crawl HTTP ${res.status}`); const html=await res.text(); return { finalUrl: res.url||target, html }; }
   finally{ if(t)clearTimeout(t); }
 }
@@ -76,6 +79,42 @@ async function getGoogleResults({q,location,apiKey,signal}){
 }
 const getLocalResults=({q,location,apiKey,signal})=>searchapi("google_local",{q,location,gl:"us",hl:"en"},{apiKey,signal});
 
+/* ---------------- helpers: PageSpeed Insights ---------------- */
+function normalizePageSpeed(json, strategy="mobile"){
+  const lr=json?.lighthouseResult; if(!lr) return { available:false };
+  const cat=lr.categories||{}; const a=lr.audits||{};
+  const pct=(s)=> typeof s==="number" ? Math.round(s*100) : null;
+  const lab={
+    performanceScore: pct(cat.performance?.score), seoScore: pct(cat.seo?.score),
+    lcpMs: a["largest-contentful-paint"]?.numericValue??null, lcpDisplay: a["largest-contentful-paint"]?.displayValue??null,
+    cls: a["cumulative-layout-shift"]?.numericValue??null, clsDisplay: a["cumulative-layout-shift"]?.displayValue??null,
+    tbtDisplay: a["total-blocking-time"]?.displayValue??null, fcpDisplay: a["first-contentful-paint"]?.displayValue??null,
+    speedIndexDisplay: a["speed-index"]?.displayValue??null
+  };
+  const le=json.loadingExperience||json.originLoadingExperience||null; const m=le?.metrics||{};
+  const field=(le && Object.keys(m).length) ? {
+    hasData:true, overall: le.overall_category||null,
+    lcpMs: m.LARGEST_CONTENTFUL_PAINT_MS?.percentile??null, lcpCategory: m.LARGEST_CONTENTFUL_PAINT_MS?.category??null,
+    inpMs: m.INTERACTION_TO_NEXT_PAINT?.percentile??null, inpCategory: m.INTERACTION_TO_NEXT_PAINT?.category??null,
+    cls: (m.CUMULATIVE_LAYOUT_SHIFT_SCORE?.percentile!=null ? m.CUMULATIVE_LAYOUT_SHIFT_SCORE.percentile/100 : null), clsCategory: m.CUMULATIVE_LAYOUT_SHIFT_SCORE?.category??null
+  } : { hasData:false };
+  return { available:true, strategy, lab, field };
+}
+async function getPageSpeed(url,{apiKey,signal}={}){
+  const ctrl=signal?null:new AbortController(); const t=ctrl?setTimeout(()=>ctrl.abort(),25000):null;
+  try{
+    const u=new URL(PSI_BASE);
+    u.searchParams.set("url", /^https?:\/\//i.test(url)?url:`https://${url}`);
+    u.searchParams.set("strategy","mobile");
+    u.searchParams.append("category","PERFORMANCE"); u.searchParams.append("category","SEO");
+    if(apiKey) u.searchParams.set("key",apiKey);
+    const res=await fetch(u,{signal:signal||ctrl.signal,headers:{Accept:"application/json"}});
+    if(!res.ok) throw new Error(`PageSpeed HTTP ${res.status}`);
+    const json=await res.json();
+    return normalizePageSpeed(json,"mobile");
+  } finally { if(t)clearTimeout(t); }
+}
+
 /* ---------------- helpers: normalize + bundle ---------------- */
 const sameDomain=(c,cl)=>!c||!cl?false:(c===cl||c.endsWith("."+cl)||cl.endsWith("."+c));
 function normalizeOrganic(j){ const r=j?.organic_results; if(!Array.isArray(r))return []; return r.map((x)=>({position:x.position??null,title:x.title??null,link:x.link??null,domain:domainOf(x.link)||(x.domain?x.domain.replace(/^www\./,""):null),snippet:x.snippet??null})).filter((x)=>x.title||x.link); }
@@ -93,12 +132,12 @@ function buildSerpSlice({googleJson,localJson,aiOverviewJson,clientDomain}){
     clientLocalPosition: clientDomain?(localPack.find((l)=>sameDomain(l.domain,clientDomain))?.position??null):null };
 }
 function deriveQueries(meta){ const service=(meta.services&&meta.services[0])||meta.industry||"services"; const location=(meta.locations&&meta.locations[0])||""; const where=location?` ${location}`:""; return { local:`${service}${where}`.trim(), web:`best ${service}${location?` in ${location}`:""}`.trim(), location }; }
-function buildDataBundle(meta,{crawl,serp}){
+function buildDataBundle(meta,{crawl,serp,pagespeed}){
   const bundle={ meta:{ businessName:meta.businessName??null, website:meta.website??null, domain:meta.domain??null, locations:meta.locations??[], services:meta.services??[], industry:meta.industry??null, detected:meta.detected??{} },
-    crawl: crawl||{available:false}, serp: serp||{available:false},
-    backlinks:{available:false}, pagespeed:{available:false}, youtube:{available:false}, aiEngines:{available:false}, gsc:{available:false}, gbp:{available:false} };
-  const c=bundle.crawl.available, s=bundle.serp.available;
-  bundle.honesty={ crawl:c?HONESTY.VERIFIED:HONESTY.ASSUMED, serp:s?HONESTY.VERIFIED:HONESTY.ASSUMED, aiOverview:s?HONESTY.VERIFIED:HONESTY.ASSUMED, aiEngines:HONESTY.ASSUMED, pagespeed:HONESTY.ASSUMED, backlinks:HONESTY.ASSUMED, youtube:HONESTY.ASSUMED, gsc:HONESTY.ASSUMED, gbp:HONESTY.ASSUMED };
+    crawl: crawl||{available:false}, serp: serp||{available:false}, pagespeed: pagespeed||{available:false},
+    backlinks:{available:false}, youtube:{available:false}, aiEngines:{available:false}, gsc:{available:false}, gbp:{available:false} };
+  const c=bundle.crawl.available, s=bundle.serp.available, p=bundle.pagespeed.available;
+  bundle.honesty={ crawl:c?HONESTY.VERIFIED:HONESTY.ASSUMED, serp:s?HONESTY.VERIFIED:HONESTY.ASSUMED, aiOverview:s?HONESTY.VERIFIED:HONESTY.ASSUMED, pagespeed:p?HONESTY.VERIFIED:HONESTY.ASSUMED, aiEngines:HONESTY.ASSUMED, backlinks:HONESTY.ASSUMED, youtube:HONESTY.ASSUMED, gsc:HONESTY.ASSUMED, gbp:HONESTY.ASSUMED };
   return bundle;
 }
 
@@ -115,15 +154,29 @@ async function runAudit(body,{apiKey}={}){
   const primaryService=services[0]||industry||null;
   const meta={ businessName, website:body.url, domain:identity.domain, locations:location?[location]:[], services, industry, detected:identity.source||{} };
   const needsInput=[]; if(!location)needsInput.push("location"); if(!primaryService)needsInput.push("service");
+
+  // Fan out: PageSpeed always (URL only); SERP only when we know what + where.
+  const psiUrl=(crawl.available&&crawl.url)?crawl.url:body.url;
+  const runSerp=!!(location&&primaryService);
+  const q=runSerp?deriveQueries({services,industry,locations:[location]}):null;
+  const clientDomain=identity.domain;
+  const tasks=[ getPageSpeed(psiUrl,{apiKey:process.env.PAGESPEED_API_KEY}) ];
+  if(runSerp){ tasks.push(getGoogleResults({q:q.web,location:q.location,apiKey}), getLocalResults({q:q.local,location:q.location,apiKey})); }
+  const settled=await Promise.allSettled(tasks);
+
+  const psiRes=settled[0];
+  let pagespeed = psiRes.status==="fulfilled" ? psiRes.value : {available:false};
+  if(psiRes.status==="rejected") warnings.push(`pagespeed: ${psiRes.reason?.message||"failed"}`);
+
   let serp={available:false};
-  if(location&&primaryService){
-    const q=deriveQueries({services,industry,locations:[location]}); const clientDomain=identity.domain;
-    const [g,l]=await Promise.allSettled([ getGoogleResults({q:q.web,location:q.location,apiKey}), getLocalResults({q:q.local,location:q.location,apiKey}) ]);
+  if(runSerp){
+    const g=settled[1], l=settled[2];
     if(g.status==="fulfilled"||l.status==="fulfilled"){ serp=buildSerpSlice({ googleJson:g.status==="fulfilled"?g.value.googleJson:null, aiOverviewJson:g.status==="fulfilled"?g.value.aiOverviewJson:null, localJson:l.status==="fulfilled"?l.value:null, clientDomain }); }
     if(g.status==="rejected")warnings.push(`google: ${g.reason?.message||"failed"}`);
     if(l.status==="rejected")warnings.push(`google_local: ${l.reason?.message||"failed"}`);
   }
-  const bundle=buildDataBundle(meta,{crawl,serp});
+
+  const bundle=buildDataBundle(meta,{crawl,serp,pagespeed});
   return { meta, bundle, generatedAt:new Date().toISOString(), warnings, needsInput };
 }
 
@@ -131,7 +184,7 @@ async function runAudit(body,{apiKey}={}){
 export default async function handler(req, res){
   res.setHeader("Cache-Control","no-store");
   if(req.method==="GET"){
-    return res.status(200).json({ service:"GEO Architect /api/audit", method:"POST", body:{ url:"https://any-business.com", overrides:{ location:"City, ST (optional)", service:"optional" } }, keyConfigured: Boolean(process.env.SEARCHAPI_KEY) });
+    return res.status(200).json({ service:"GEO Architect /api/audit", version:"0.3", method:"POST", body:{ url:"https://any-business.com", overrides:{ location:"City, ST (optional)", service:"optional" } }, searchApiKey: Boolean(process.env.SEARCHAPI_KEY), pageSpeedKey: Boolean(process.env.PAGESPEED_API_KEY), keyConfigured: Boolean(process.env.SEARCHAPI_KEY) });
   }
   if(req.method!=="POST") return res.status(405).json({ error:"Use POST with a JSON body { \"url\": \"...\" }" });
   if(!process.env.SEARCHAPI_KEY) return res.status(500).json({ error:"SEARCHAPI_KEY is not configured. Add it in Vercel → Settings → Environment Variables." });
@@ -139,7 +192,7 @@ export default async function handler(req, res){
   if(!body||typeof body!=="object"||!body.url) return res.status(400).json({ error:"Provide a JSON body like { \"url\": \"https://example.com\" }" });
   try{
     const result=await runAudit(body,{ apiKey: process.env.SEARCHAPI_KEY });
-    if(!result.bundle.crawl.available && !result.bundle.serp.available) return res.status(502).json({ error:"Could not read that website.", warnings: result.warnings });
+    if(!result.bundle.crawl.available && !result.bundle.serp.available && !result.bundle.pagespeed.available) return res.status(502).json({ error:"Could not read that website.", warnings: result.warnings });
     if(result.needsInput.length) return res.status(200).json({ status:"needs_input", message:`Crawled the site, but couldn't auto-detect: ${result.needsInput.join(" and ")}. Re-send with overrides.`, needsInput: result.needsInput, detected: result.meta, bundle: result.bundle });
     return res.status(200).json(result);
   }catch(err){ return res.status(500).json({ error:"Unexpected error.", detail: err?.message }); }
