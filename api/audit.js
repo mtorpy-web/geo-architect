@@ -1,10 +1,10 @@
-// api/audit.js  —  GEO Architect: single-file Vercel serverless function (v0.3.1).
+// api/audit.js  —  GEO Architect: single-file Vercel serverless function (v0.3).
 // POST { "url": "https://any-business.com" }  -> crawls the site, derives
 // name/location/services, runs SearchApi.io (local pack + organic + AI Overview)
 // AND PageSpeed Insights (Core Web Vitals), returns an honesty-tagged DataBundle.
 // Keys read from env, never returned. Zero dependencies. Node 18+ (global fetch).
 
-export const config = { maxDuration: 60 }; // PageSpeed Lighthouse runs can be slow
+export const config = { maxDuration: 90 }; // PageSpeed Lighthouse runs can be slow
 
 const HONESTY = { VERIFIED: "VERIFIED", ASSUMED: "ASSUMED" };
 const SEARCHAPI_BASE = "https://www.searchapi.io/api/v1/search";
@@ -101,7 +101,7 @@ function normalizePageSpeed(json, strategy="mobile"){
   return { available:true, strategy, lab, field };
 }
 async function getPageSpeed(url,{apiKey,signal}={}){
-  const ctrl=signal?null:new AbortController(); const t=ctrl?setTimeout(()=>ctrl.abort(),25000):null;
+  const ctrl=signal?null:new AbortController(); const t=ctrl?setTimeout(()=>ctrl.abort(),45000):null;
   try{
     const u=new URL(PSI_BASE);
     u.searchParams.set("url", /^https?:\/\//i.test(url)?url:`https://${url}`);
@@ -197,3 +197,5 @@ export default async function handler(req, res){
     return res.status(200).json(result);
   }catch(err){ return res.status(500).json({ error:"Unexpected error.", detail: err?.message }); }
 }
+
+export { parseSite, buildSerpSlice, buildDataBundle, deriveQueries, runAudit, normalizePageSpeed };
